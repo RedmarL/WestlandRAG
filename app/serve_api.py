@@ -1,9 +1,10 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 import ollama
+import language_tool_python
 
 app = FastAPI()
 
@@ -16,15 +17,12 @@ app.add_middleware(
 )
 
 # ======= MODEL EN VECTORSTORE =======
-model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+model = SentenceTransformer("sentence-transformers/paraphrase-multilingual-mpnet-base-v2")
 client = QdrantClient("localhost", port=6333)
 
-# ======= HELPER FUNCTIES =======
+tool = language_tool_python.LanguageTool('nl-NL')
+
 def bronvermelding_from_source(source_value):
-    """
-    Zet een chunknaam om in de juiste URL.
-    Als de bron al een volledige url is, geef gewoon die terug.
-    """
     if not source_value:
         return "https://www.gemeentewestland.nl/"
     if source_value.startswith("http"):
@@ -39,7 +37,6 @@ def extract_text(hit):
 def extract_source(hit):
     return hit.payload.get('source', '')
 
-# ======= API DEFINITIE =======
 class VraagInput(BaseModel):
     vraag: str
 
@@ -49,7 +46,7 @@ def chat(vraag_input: VraagInput):
     vraag_vec = model.encode([vraag])[0].tolist()
 
     hits_response = client.query_points(
-        collection_name="westland",
+        collection_name="westland-mpnet",
         query=vraag_vec,
         limit=3,
         with_payload=True
@@ -57,29 +54,32 @@ def chat(vraag_input: VraagInput):
     hits = hits_response.points
 
     context = "\n\n".join([extract_text(h) for h in hits])
-    # Unieke bronnen, volgorde behouden
     bronnen = []
     for h in hits:
         url = bronvermelding_from_source(extract_source(h))
         if url not in bronnen:
             bronnen.append(url)
-
     bronnen_tekst = "\n\nBronnen:\n" + "\n".join(f"[{i+1}] {b}" for i, b in enumerate(bronnen))
 
+    # **Prompt: nog duidelijker Nederlands!**
     prompt = (
         "Beantwoord de onderstaande vraag op basis van de context. "
-        "Schrijf een helder en vloeiend antwoord. Let op spelling en grammatica. Gebruik altijd u of uw.\n"
-        "Je hoeft in de tekst geen bronnen te noemen; deze worden eronder weergegeven.\n\n"
+        "Schrijf een helder, vloeiend en correct antwoord in natuurlijk Nederlands, "
+        "zonder spelfouten of kromme zinnen. Je hoeft bronnen niet in de tekst te noemen; deze worden eronder weergegeven.\n\n"
         f"{context}\n\nVraag: {vraag}"
     )
 
     response = ollama.chat(
         model='mistral',
         messages=[
-            {"role": "system", "content": "Beantwoord alles in het Nederlands."},
+            {"role": "system", "content": "Geef altijd helder, correct, en natuurlijk Nederlands als antwoord."},
             {"role": "user", "content": prompt}
         ]
     )
 
-    antwoord = response['message']['content'] + bronnen_tekst
+    # **Spellingscontrole alleen op het hoofdantwoord**
+    raw_answer = response['message']['content']
+    main_part, sep, bronnen_part = raw_answer.partition('\n\nBronnen:\n')
+    antwoord_gecorrigeerd = tool.correct(main_part)
+    antwoord = antwoord_gecorrigeerd + (sep + bronnen_part if bronnen_part else bronnen_tekst)
     return {"antwoord": antwoord}

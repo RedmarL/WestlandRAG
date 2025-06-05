@@ -2,14 +2,14 @@ from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 import ollama
 
-model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+model = SentenceTransformer('paraphrase-multilingual-mpnet-base-v2')
 client = QdrantClient("localhost", port=6333)
 
 vraag = "Hoe vraag ik een paspoort aan?"
 vraag_vec = model.encode([vraag])[0].tolist()
 
 hits_response = client.query_points(
-    collection_name="westland",
+    collection_name="westland-mpnet",
     query=vraag_vec,
     limit=3,
     with_payload=True
