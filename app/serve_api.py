@@ -23,39 +23,21 @@ client = QdrantClient("localhost", port=6333)
 def bronvermelding_from_source(source_value):
     """
     Zet een chunknaam om in de juiste URL.
-    Bijvoorbeeld:
-    '_aanvragen-en-regelen_afval-en-huisvuil_afval_chunk11'
-    → 'https://www.gemeentewestland.nl/aanvragen-en-regelen/afval-en-huisvuil/afval'
+    Als de bron al een volledige url is, geef gewoon die terug.
     """
-    # Verwijder '_chunkXX' aan het eind
+    if not source_value:
+        return "https://www.gemeentewestland.nl/"
+    if source_value.startswith("http"):
+        return source_value
     parts = source_value.split('_chunk')[0]
-    
-    # Verwijder leading underscore en vervang underscores door slashes
     clean_path = parts.lstrip('_').replace('_', '/')
-    
-    # Bouw de URL
     return f"https://www.gemeentewestland.nl/{clean_path}"
 
-
 def extract_text(hit):
-    if hasattr(hit, 'payload'):
-        return hit.payload['text']
-    elif isinstance(hit, dict) and 'payload' in hit:
-        return hit['payload']['text']
-    elif isinstance(hit, tuple) and len(hit) >= 3:
-        return hit[2]['text']
-    else:
-        return str(hit)
+    return hit.payload.get('text', '')
 
 def extract_source(hit):
-    if hasattr(hit, 'payload'):
-        return hit.payload.get('source', '')
-    elif isinstance(hit, dict) and 'payload' in hit:
-        return hit['payload'].get('source', '')
-    elif isinstance(hit, tuple) and len(hit) >= 3:
-        return hit[2].get('source', '')
-    else:
-        return ''
+    return hit.payload.get('source', '')
 
 # ======= API DEFINITIE =======
 class VraagInput(BaseModel):
@@ -66,18 +48,30 @@ def chat(vraag_input: VraagInput):
     vraag = vraag_input.vraag
     vraag_vec = model.encode([vraag])[0].tolist()
 
-    hits = client.query_points(
+    hits_response = client.query_points(
         collection_name="westland",
         query=vraag_vec,
         limit=3,
         with_payload=True
     )
+    hits = hits_response.points
 
     context = "\n\n".join([extract_text(h) for h in hits])
-    bronnen = [bronvermelding_from_source(extract_source(h)) for h in hits]
-    bronnen_tekst = "\n\nBronnen:\n" + "\n".join(bronnen)
+    # Unieke bronnen, volgorde behouden
+    bronnen = []
+    for h in hits:
+        url = bronvermelding_from_source(extract_source(h))
+        if url not in bronnen:
+            bronnen.append(url)
 
-    prompt = f"Beantwoord deze vraag op basis van de context:\n{context}\n\nVraag: {vraag}"
+    bronnen_tekst = "\n\nBronnen:\n" + "\n".join(f"[{i+1}] {b}" for i, b in enumerate(bronnen))
+
+    prompt = (
+        "Beantwoord de onderstaande vraag op basis van de context. "
+        "Schrijf een helder en vloeiend antwoord. Let op spelling en grammatica. Gebruik altijd u of uw.\n"
+        "Je hoeft in de tekst geen bronnen te noemen; deze worden eronder weergegeven.\n\n"
+        f"{context}\n\nVraag: {vraag}"
+    )
 
     response = ollama.chat(
         model='mistral',

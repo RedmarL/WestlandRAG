@@ -8,6 +8,12 @@
     #chatbox { width: 100%; height: 320px; background: #fff; padding: 12px; margin-bottom: 10px; overflow-y: auto; border-radius: 8px; border: 1px solid #ccc;}
     #vraag { width: 80%; font-size: 1em; }
     #send { font-size: 1em; }
+    .antwoord { margin-bottom: 1em; }
+    .bronnenbox { background: #f2f6fa; border-radius: 6px; padding: 8px 14px; margin-top: 4px; border-left: 4px solid #6495ed;}
+    .bronnenbox ul { margin: 0 0 0 1.2em; padding: 0; }
+    .bronnenbox li { font-size: 0.96em; line-height: 1.6; margin-bottom: 0.25em;}
+    .ai-label { color: #0070c9; }
+    .user-label { color: #777; }
   </style>
 </head>
 <body>
@@ -22,8 +28,40 @@
     const sendBtn = document.getElementById('send');
 
     function appendMessage(wie, text) {
-      chatbox.innerHTML += `<b>${wie}:</b> ${text}<br>`;
+      if (wie === "AI") {
+        const {antwoord, bronnenHtml} = formatAntwoordMetBronnen(text);
+        chatbox.innerHTML += `<div class="antwoord"><b class="ai-label">AI:</b> ${antwoord}${bronnenHtml}</div>`;
+      } else {
+        chatbox.innerHTML += `<div><b class="user-label">Jij:</b> ${escapeHtml(text)}</div>`;
+      }
       chatbox.scrollTop = chatbox.scrollHeight;
+    }
+
+    function formatAntwoordMetBronnen(antwoord) {
+      // Verwacht: antwoord gevolgd door "\n\nBronnen:\n[1] url\n[2] url..."
+      let [main, ...rest] = antwoord.split('\n\nBronnen:\n');
+      let bronnenHtml = "";
+      if (rest.length > 0) {
+        const bronnen = rest.join('').split(/\n/).filter(x => x.trim());
+        if (bronnen.length) {
+          bronnenHtml = `<div class="bronnenbox"><b>Bronnen:</b><ul>`;
+          bronnen.forEach(b => {
+            // laat alleen het nummer en de url zien
+            bronnenHtml += `<li>${escapeHtml(b)}</li>`;
+          });
+          bronnenHtml += `</ul></div>`;
+        }
+      }
+      return {antwoord: escapeHtml(main).replace(/\n/g, "<br>"), bronnenHtml};
+    }
+
+    function escapeHtml(unsafe) {
+      return unsafe
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
     }
 
     async function verstuurVraag() {
@@ -39,7 +77,7 @@
       });
       const data = await response.json();
       // Vervang laatste AI-message door echt antwoord
-      chatbox.innerHTML = chatbox.innerHTML.replace('<b>AI:</b> <em>Even denken...</em><br>', '');
+      chatbox.innerHTML = chatbox.innerHTML.replace('<div class="antwoord"><b class="ai-label">AI:</b> <em>Even denken...</em></div>', '');
       appendMessage('AI', data.antwoord);
     }
 
