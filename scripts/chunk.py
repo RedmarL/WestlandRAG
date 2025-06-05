@@ -1,40 +1,58 @@
 import pathlib
 import requests
 import time
+import json
 from tqdm import tqdm
 
+# 📁 Paden instellen
 TXT_DIR = pathlib.Path('data/cleaned_txt')
-CHUNK_DIR = pathlib.Path('data/chunks'); CHUNK_DIR.mkdir(exist_ok=True)
+CHUNK_DIR = pathlib.Path('data/chunks')
+CHUNK_DIR.mkdir(exist_ok=True)
+
 CHUNK_SIZE = 300
 
-def get_url_from_filename(filename):
-    # Verwijder .txt en vervang underscores met slashes
-    clean_path = filename.stem.replace("_", "/")
-    return f"https://www.gemeentewestland.nl/{clean_path}"
-
+# 🌐 Check of URL werkt
 def pagina_beschikbaar(url):
     try:
         response = requests.get(url, timeout=10)
-        if response.status_code == 404:
-            return False
-        if "Pagina niet gevonden" in response.text:
+        if response.status_code == 404 or "Pagina niet gevonden" in response.text:
             return False
         return True
     except Exception:
         return False
 
-for txtfile in tqdm(list(TXT_DIR.glob('*.txt')), desc="Chunks maken"):
-    url = get_url_from_filename(txtfile)
+# 🚀 Start verwerkingslus
+all_files = list(TXT_DIR.glob('*.json'))
+print(f"🔍 Start met chunken van {len(all_files)} bestanden...\n")
 
-    if not pagina_beschikbaar(url):
-        print(f"⚠️  Overgeslagen (niet beschikbaar): {url}")
+for jsonfile in tqdm(all_files, desc="📄 Pagina's verwerken", unit="pagina"):
+    with open(jsonfile, encoding='utf-8') as f:
+        data = json.load(f)
+
+    text = data.get("text", "")
+    url = data.get("url", "")
+
+    if not text or not url:
+        tqdm.write(f"⚠️  Overgeslagen (leeg): {jsonfile.name}")
         continue
 
-    text = txtfile.read_text('utf-8')
+    if not pagina_beschikbaar(url):
+        tqdm.write(f"❌ Niet beschikbaar: {url}")
+        continue
+
     chunks = [text[i:i+CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)]
 
     for idx, chunk in enumerate(chunks):
-        outfile = CHUNK_DIR / f"{txtfile.stem}_chunk{idx}.txt"
-        outfile.write_text(chunk, 'utf-8')
+        chunk_data = {
+            "text": chunk,
+            "source": url
+        }
+        outpath = CHUNK_DIR / f"{jsonfile.stem}_chunk{idx}.json"
+        with open(outpath, 'w', encoding='utf-8') as f:
+            json.dump(chunk_data, f, ensure_ascii=False, indent=2)
 
-    time.sleep(0.2)  # om server te ontzien
+    tqdm.write(f"✅ {jsonfile.name} → {len(chunks)} chunks")
+
+    time.sleep(0.2)
+
+print("\n🎉 Alle pagina's zijn gechunked!")

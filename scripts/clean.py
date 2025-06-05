@@ -18,6 +18,10 @@ for jsonfile in RAW_DIR.glob('*.json'):
 
     text = trafilatura.extract(html)
     if text:
-        outpath = TXT_DIR / jsonfile.with_suffix('.txt').name
+        output = {
+            "url": url,
+            "text": text
+        }
+        outpath = TXT_DIR / jsonfile.with_suffix('.json').name
         with open(outpath, 'w', encoding='utf-8') as f:
-            f.write(text)
+            json.dump(output, f, ensure_ascii=False, indent=2)

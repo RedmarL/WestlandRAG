@@ -32,21 +32,23 @@ def extract_text(hit):
         return hit[2].get('text', '')
     return ""
 
+# 📦 Haal source uit payload
+def extract_source(hit):
+    if hasattr(hit, 'payload'):
+        return hit.payload.get('source', '')
+    elif isinstance(hit, dict):
+        return hit.get('payload', {}).get('source', '')
+    elif isinstance(hit, tuple) and len(hit) >= 3:
+        return hit[2].get('source', '')
+    return ""
+
 # 📚 Verzamel context en bronvermeldingen
 context = "\n\n".join([extract_text(h) for h in hits])
 
 bronnen = set()
 for h in hits:
     try:
-        if hasattr(h, 'payload'):
-            source = h.payload.get('source', '')
-        elif isinstance(h, dict):
-            source = h.get('payload', {}).get('source', '')
-        elif isinstance(h, tuple) and len(h) >= 3:
-            source = h[2].get('source', '')
-        else:
-            continue
-
+        source = extract_source(h)
         url = bronvermelding_from_source(source)
         bronnen.add(url)
     except Exception:
@@ -66,6 +68,10 @@ response = ollama.chat(
 # ✅ Print antwoord + bronnen
 print("\n🟢 Antwoord:\n")
 print(response['message']['content'])
+
+print("\n🔗 Gevonden bronnen:")
+for h in hits:
+    print("-", extract_source(h))
 
 print("\n📚 Bronvermelding:")
 for url in sorted(bronnen):
