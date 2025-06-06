@@ -90,7 +90,7 @@ def chat(vraag_input: VraagInput):
             f"Context:\n{combined_text}\n\nVraag: {vraag}"
         )
         eerste_response = ollama.chat(
-            model='mistral',
+            model='bramvanroy/geitje-7b-ultra:Q5_K_M',
             messages=[
                 {"role": "system", "content": "Beantwoord in feitelijk, correct Nederlands."},
                 {"role": "user", "content": eerste_prompt}
