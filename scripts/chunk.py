@@ -1,58 +1,76 @@
-import pathlib
-import requests
-import time
-import json
+# scripts/chunk.py  (Python 3.10+)
+import pathlib, json, time, requests
+from typing import List
 from tqdm import tqdm
+from transformers import AutoTokenizer                 # NEW
 
-# 📁 Paden instellen
-TXT_DIR = pathlib.Path('data/cleaned_txt')
-CHUNK_DIR = pathlib.Path('data/chunks')
+# ---------- constants ----------
+TXT_DIR   = pathlib.Path("data/cleaned_txt")
+CHUNK_DIR = pathlib.Path("data/chunks")
 CHUNK_DIR.mkdir(exist_ok=True)
 
-CHUNK_SIZE = 300
+MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+tokenizer   = AutoTokenizer.from_pretrained(MODEL_NAME)
 
-# 🌐 Check of URL werkt
-def pagina_beschikbaar(url):
+MAX_TOKENS  = 2048          # keep entire doc if it fits
+OVERLAP     = 50            # token overlap when we must split
+
+# ---------- helpers ----------
+def url_alive(url: str) -> bool:
     try:
-        response = requests.get(url, timeout=10)
-        if response.status_code == 404 or "Pagina niet gevonden" in response.text:
-            return False
-        return True
+        r = requests.head(url, timeout=5)
+        return r.status_code < 400
     except Exception:
         return False
 
-# 🚀 Start verwerkingslus
-all_files = list(TXT_DIR.glob('*.json'))
-print(f"🔍 Start met chunken van {len(all_files)} bestanden...\n")
+def split_by_tokens(text: str) -> List[str]:
+    """Paragraph-aware token splitting."""
+    paragraphs = [p for p in text.split("\n") if p.strip()]
+    chunks, current, cur_len = [], [], 0
 
-for jsonfile in tqdm(all_files, desc="📄 Pagina's verwerken", unit="pagina"):
-    with open(jsonfile, encoding='utf-8') as f:
-        data = json.load(f)
+    for para in paragraphs:
+        plen = len(tokenizer.encode(para, add_special_tokens=False))
+        if cur_len + plen > MAX_TOKENS:
+            chunks.append(" ".join(current))
+            # start new chunk, keep overlap for continuity
+            overlap = current[-OVERLAP:] if OVERLAP < len(current) else current
+            current = overlap.copy()
+            cur_len = len(tokenizer.encode(" ".join(current), add_special_tokens=False))
+        current.append(para)
+        cur_len += plen
+    if current:
+        chunks.append(" ".join(current))
+    return chunks
 
-    text = data.get("text", "")
-    url = data.get("url", "")
+# ---------- main ----------
+txt_files = list(TXT_DIR.glob("*.json"))
+print(f"🔍 Found {len(txt_files)} cleaned pages.")
 
-    if not text or not url:
-        tqdm.write(f"⚠️  Overgeslagen (leeg): {jsonfile.name}")
+for jf in tqdm(txt_files, desc="Chunking"):
+    data = json.loads(jf.read_text(encoding="utf-8"))
+    text, url = data.get("text", "").strip(), data.get("url") or data.get("source")
+
+    if not text:
+        tqdm.write(f"⚠️ Skipped (empty): {jf.name}")
+        continue
+    if not url_alive(url):
+        tqdm.write(f"❌ Unreachable URL: {url}")
         continue
 
-    if not pagina_beschikbaar(url):
-        tqdm.write(f"❌ Niet beschikbaar: {url}")
-        continue
+    # Decide whether to split
+    tok_len = len(tokenizer.encode(text, add_special_tokens=False))
+    if tok_len <= MAX_TOKENS:
+        chunks = [text]
+    else:
+        chunks = split_by_tokens(text)
 
-    chunks = [text[i:i+CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)]
-
+    # write out each chunk
     for idx, chunk in enumerate(chunks):
-        chunk_data = {
-            "text": chunk,
-            "source": url
-        }
-        outpath = CHUNK_DIR / f"{jsonfile.stem}_chunk{idx}.json"
-        with open(outpath, 'w', encoding='utf-8') as f:
-            json.dump(chunk_data, f, ensure_ascii=False, indent=2)
-
-    tqdm.write(f"✅ {jsonfile.name} → {len(chunks)} chunks")
-
+        out = CHUNK_DIR / f"{jf.stem}_chunk{idx}.json"
+        json.dump({"text": chunk, "source": url},
+                  out.open("w", encoding="utf-8"),
+                  ensure_ascii=False, indent=2)
+    tqdm.write(f"✅ {jf.name} → {len(chunks)} chunk(s)")
     time.sleep(0.2)
 
-print("\n🎉 Alle pagina's zijn gechunked!")
+print("\n🎉 All pages processed.")

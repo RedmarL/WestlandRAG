@@ -264,6 +264,8 @@
       chatbox.innerHTML = chatbox.innerHTML.replace(
         /<div class="antwoord">[\s\S]*?Even denken[\s\S]*?<\/div>/, ''
       );
+      
+      console.log("data.resultaat", data.resultaat);
 
       if (data.resultaat) {
         appendMessage('AI', formatResultaatAntwoord(data.resultaat), true);
