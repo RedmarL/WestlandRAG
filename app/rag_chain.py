@@ -74,6 +74,7 @@ for gekozen_url in top_urls:
         f"Als het antwoord niet letterlijk in de context staat, zeg: 'Het antwoord op uw vraag is niet terug te vinden in de gevonden informatie.'\n\n"
         f"Gebruik taalgebruik dat overeenkomt met de stijl van de bron.\n\n"
         f"Maak geen spelfouten en gebruik correcte grammatica.\n\n"
+        f"Gebruik altijd u in plaats van jij.\n\n"
         f"{combined_text}\n\nVraag: {vraag}"
     )
 
