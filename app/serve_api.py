@@ -100,18 +100,21 @@ def chat(vraag_input: VraagInput):
 
         # ===== 2e prompt: Reflecteer, structureer en motiveer =====
         tweede_prompt = (
-            "Hieronder staat een antwoord op een vraag over gemeentelijke dienstverlening.\n"
-            "Splits het antwoord in een kernboodschap (hoofdantwoord) en eventuele bijzinnen/waarschuwingen "
+            "Hieronder staat een feitelijk antwoord op een vraag over gemeentelijke dienstverlening.\n"
+            "Verbeter dit antwoord door te controleren of het duidelijk, volledig en bruikbaar is voor een burger die deze vraag stelt. "
+            "Vul het antwoord aan met relevante details uit de context als dat nodig is om de vraag écht te beantwoorden, maar voeg niets toe wat niet in de context voorkomt.\n\n"
+            "Splits het resultaat in een kernboodschap (snippet/hoofdantwoord) en eventuele bijzinnen of waarschuwingen "
             "(zoals zinnen beginnend met 'Let op', 'Bijzonderheden', 'Bent u', etc.).\n"
-            "Maak het antwoord begrijpelijk, prettig leesbaar en controleer op spelling.\n"
             "Geef de output in het volgende JSON-formaat:\n"
             "{\n"
-            '  "snippet": "<hoofdantwoord>",\n'
+            '  "snippet": "<duidelijke hoofdantwoord>",\n'
             '  "extra": ["<bijzonderheid 1>", "<bijzonderheid 2>", ...],\n'
-            '  "toelichting": "<korte uitleg waarom je deze indeling hebt gemaakt>"\n'
+            '  "toelichting": "<korte uitleg waarom je deze selectie en aanvulling hebt gemaakt>"\n'
             "}\n\n"
-            f"Antwoord:\n{ruw_antwoord}"
+            f"Context:\n{combined_text}\n\n"
+            f"Oorspronkelijk antwoord:\n{ruw_antwoord}"
         )
+
         tweede_response = ollama.chat(
             model='mistral',
             messages=[
@@ -139,7 +142,6 @@ def chat(vraag_input: VraagInput):
             "bron": bronvermelding_from_source(gekozen_url)
         }
 
-        # Alleen retourneren als het geen "niet gevonden" is
         if (
             "Het antwoord op uw vraag is niet terug te vinden" not in hoofd_correct
             and "geen specifiek antwoord gevonden" not in hoofd_correct.lower()
