@@ -1,3 +1,10 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+FastAPI app for semantic search in municipal data.
+Includes keyword-based filtering for more relevant chunk selection.
+"""
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
@@ -12,6 +19,8 @@ import json
 import ast
 import re
 from time import time
+import traceback
+
 
 # === Setup ===
 load_dotenv()
@@ -30,6 +39,12 @@ model = None
 beschikbare_urls = []
 client_qdrant = QdrantClient("localhost", port=6333)
 
+# === Keyword set ===
+KEYWORD_PATH = "data/keyword_set.json"
+with open(KEYWORD_PATH, encoding="utf-8") as f:
+    KEYWORDS = set(json.load(f))
+
+# === Utilities ===
 def nesting_level(url):
     path = url.split("://", 1)[-1].split("/", 1)[-1]
     return path.count("/")
@@ -113,13 +128,10 @@ def parse_llm_json(response):
             return None
 
 def clean_snippet(snippet):
-    # Verwijder Markdown codeblokken/backticks en extraheer innerlijke JSON-string als nodig
     if isinstance(snippet, str):
-        # Strip alle markdown-blocks en backticks
         snippet = re.sub(r"^```(?:json)?", "", snippet.strip(), flags=re.MULTILINE)
         snippet = re.sub(r"```$", "", snippet.strip(), flags=re.MULTILINE)
         snippet = snippet.strip()
-        # Probeer nog één keer te parsen als het alsnog een JSON-string is
         try:
             obj = json.loads(snippet)
             if isinstance(obj, dict) and "snippet" in obj:
@@ -128,6 +140,7 @@ def clean_snippet(snippet):
             pass
     return snippet
 
+# === Main chat endpoint ===
 @app.post("/chat")
 def chat(vraag_input: VraagInput):
     originele_vraag = vraag_input.vraag.strip()
@@ -161,13 +174,12 @@ def chat(vraag_input: VraagInput):
         "Je bent een AI-assistent voor gemeentelijke dienstverlening. "
         "Je krijgt een lijst van pagina's van de gemeente met hun beschrijvingen. "
         "Kies maximaal vijf pagina's waarin het meest waarschijnlijk het antwoord op de vraag te vinden is. "
-        "Geef alleen een JSON-lijst met de gekozen URLs (dus niet de beschrijvingen en geen tekst buiten de lijst).\n\n"
+        "Geef alleen een JSON-lijst met de gekozen URLs.\n\n"
         f"Vraag: {vraag}\n\nBeschikbare pagina's:\n{lijst_prompt}"
     )
 
     try:
         top5_urls_antwoord = chat_openai("Je bent een behulpzame taalassistent.", selectie_prompt)
-        print("LLM selectie output:", top5_urls_antwoord)
         gekozen_urls = parse_llm_json(top5_urls_antwoord)
         if not gekozen_urls or not isinstance(gekozen_urls, list):
             raise ValueError("LLM gaf geen geldige lijst")
@@ -177,12 +189,34 @@ def chat(vraag_input: VraagInput):
 
     print("gekozen_urls:", gekozen_urls)
 
+    # === Keyword filtering ===
+    vraag_tokens = set(re.findall(r"\w+", vraag.lower()))
+    vraag_keywords = vraag_tokens & KEYWORDS
+
+    print("📌 Vraag bevat bekende keywords:", vraag_keywords)
+
     alle_chunks = []
+
     for gekozen_url in gekozen_urls:
-        filter = models.Filter(must=[models.FieldCondition(key="source", match=models.MatchValue(value=gekozen_url))])
-        hits = client_qdrant.scroll("westland-mpnet", scroll_filter=filter, with_payload=True, limit=20)
+        filter = models.Filter(must=[
+            models.FieldCondition(key="source", match=models.MatchValue(value=gekozen_url))
+        ])
+        hits = client_qdrant.scroll("westland-openai-embedding", scroll_filter=filter, with_payload=True, limit=20)
         hits = hits[0] if isinstance(hits, tuple) else hits
-        alle_chunks.extend(hits)
+
+        if not vraag_keywords:
+            alle_chunks.extend(hits)
+            continue
+
+        relevant_hits = [
+            h for h in hits if vraag_keywords & set(h.payload.get("keywords", []))
+        ]
+
+        if relevant_hits:
+            print(f"✅ {gekozen_url} matched {len(relevant_hits)} relevant chunks via keywords.")
+            alle_chunks.extend(relevant_hits)
+        else:
+            print(f"⛔ {gekozen_url} skipped due to no keyword match.")
 
     if not alle_chunks:
         return {
@@ -244,34 +278,122 @@ def chat(vraag_input: VraagInput):
 
 @app.post("/debug/top-urls", response_class=PlainTextResponse)
 def debug_top_urls(vraag_input: VraagInput):
-    originele_vraag = vraag_input.vraag.strip()
-    vraag = herformuleer_vraag(originele_vraag)
-    vraag_embedding = model.encode(vraag).tolist()
+    try:
+        originele_vraag = vraag_input.vraag.strip()
 
-    search_result = client_qdrant.search(
-        collection_name="westland-url-descriptions",
-        query_vector=vraag_embedding,
-        limit=25,
-        with_payload=True
-    )
+        # Stap 1 – herformuleer de vraag semantisch
+        vraag = herformuleer_vraag(originele_vraag)
+        vraag_lower = vraag.lower()
 
-    top_hits = []
-    for hit in search_result:
-        url = hit.payload.get("url")
-        beschrijving = hit.payload.get("description", "")
-        if url:
+        # Stap 2 – check welke keywords (uit set) letterlijk voorkomen in de vraag
+        vraag_keywords = {kw for kw in KEYWORDS if kw.lower() in vraag_lower}
+
+        output = []
+        output.append("🔎 DEBUG: keyword-matching proces starten...\n")
+        output.append(f"🧾 Oorspronkelijke vraag: {originele_vraag}")
+        output.append(f"🧠 Geherformuleerde zoekvraag: {vraag}")
+        output.append(f"📌 Keywords herkend in vraag (uit set): {sorted(vraag_keywords)}\n")
+
+        # 🔎 Stap 3 – hybride selectie: eerst keyword-filter op beschrijvingen
+        beschrijving_dict = {u["url"]: u["beschrijving"] for u in beschikbare_urls}
+
+        # 1. Harde keyword filter op tekst
+        voorgeselecteerd = []
+        for url, beschrijving in beschrijving_dict.items():
+            tekst = f"{url} {beschrijving}".lower()
+            if any(kw in tekst for kw in vraag_keywords):
+                voorgeselecteerd.append((url, beschrijving))
+
+        if not voorgeselecteerd:
+            output.append("⚠️ Geen URLs gevonden met keyword-match in beschrijving of URL.")
+            return "\n".join(output)
+
+        # 2. Beperk eventueel tot top 30 op lengte/score/random (optioneel)
+        voorgeselecteerd = voorgeselecteerd[:30]
+
+        output.append(f"🔍 {len(voorgeselecteerd)} URLs gematcht op keyword in beschrijving of URL.\n")
+
+        # 3. Vector similarity over deze subset
+        from numpy import dot
+        from numpy.linalg import norm
+
+        vraag_embedding = model.encode(vraag).tolist()
+        beschrijving_embeddings = model.encode([b for _, b in voorgeselecteerd]).tolist()
+
+        top_hits = []
+        for i, (url, beschrijving) in enumerate(voorgeselecteerd):
+            emb = beschrijving_embeddings[i]
+            score = dot(vraag_embedding, emb) / (norm(vraag_embedding) * norm(emb))
             lvl = nesting_level(url)
             seg = hoofdsegment(url)
-            top_hits.append((hit.score, url, beschrijving, lvl, seg))
-    top_urls = apply_nesting_boost(top_hits)
+            top_hits.append((score, url, beschrijving, lvl, seg))
 
-    lines = [
-        f"{i+1}. {url}  (score: {round(score, 4)})"
-        for i, (score, url, beschrijving) in enumerate(top_urls)
-    ]
-    output = [
-        f"Herformuleerde zoekopdracht: {vraag}",
-        "",
-        *lines
-    ]
-    return "\n".join(output)
+        # Boost met nestingstructuur en sorteer
+        top_urls = apply_nesting_boost(top_hits)
+
+
+        # Stap 4 – Eén gecombineerde scroll-query voor alle URLs
+        url_to_meta = {}
+        filters = []
+
+        for i, (score, url, beschrijving) in enumerate(top_urls):
+            filters.append(models.FieldCondition(key="source", match=models.MatchValue(value=url)))
+            url_to_meta[url] = {"score": round(score, 4), "beschrijving": beschrijving, "chunks": []}
+
+        if not filters:
+            output.append("⚠️ Geen URLs gevonden om op te zoeken.")
+            return "\n".join(output)
+
+        big_filter = models.Filter(should=filters)
+        all_hits, _ = client_qdrant.scroll(
+            collection_name="westland-openai-embedding",
+            scroll_filter=big_filter,
+            with_payload=True,
+            limit=1000  # voldoende voor max 15 URLs × 20 chunks
+        )
+
+        for hit in all_hits:
+            url = hit.payload.get("source")
+            if url in url_to_meta:
+                url_to_meta[url]["chunks"].append(hit)
+
+        # Stap 5 – Per URL keyword-overlap bepalen
+        for i, url in enumerate(url_to_meta):
+            meta = url_to_meta[url]
+            hits = meta["chunks"]
+            score = meta["score"]
+
+            output.append(f"→ 🔗 {i+1}. {url} (score: {score})")
+            output.append(f"   🧩 Aantal chunks gevonden: {len(hits)}")
+
+            matched_chunks = []
+            for h in hits:
+                chunk_kws = set(h.payload.get("keywords", []))
+                overlap = vraag_keywords & chunk_kws
+                if overlap:
+                    matched_chunks.append((h, overlap))
+
+            output.append(f"   ✅ Chunks met keyword-overlap: {len(matched_chunks)}")
+
+            if matched_chunks:
+                voorbeeld = matched_chunks[0]
+                chunk_kws = set(voorbeeld[0].payload.get("keywords", []))
+                overlap = sorted(voorbeeld[1])
+                snippet = voorbeeld[0].payload.get("text", "")[:200].replace("\n", " ")
+                output.append(f"   🔑 Keywords in chunk: {sorted(chunk_kws)}")
+                output.append(f"   🔁 Gedeelde keywords: {overlap}")
+                output.append(f"   📄 Tekstsnippet: {snippet}...")
+            else:
+                output.append(f"   ⚠️ Geen chunks met keyword-overlap.")
+
+            output.append("")
+
+        return "\n".join(output)
+    except Exception as e:
+        return f"⚠️ Er ging iets mis in de functie:\n{e}"
+
+
+@app.get("/ping")
+def ping():
+    return {"pong": "ok"}
+
