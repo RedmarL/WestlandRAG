@@ -5,14 +5,19 @@ Ingest chunks → OpenAI embeddings → Qdrant, with Dutch keywords per chunk.
 Also builds a de-duplicated keyword set for later API use.
 """
 
-import os, json, time, traceback
+import os
+import json
+import time
+import traceback
+import pathlib # NEW: For path operations
+
 from openai import OpenAI
 from keybert import KeyBERT
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from sentence_transformers import SentenceTransformer
 from stop_words import get_stop_words
-import tiktoken
+import tiktoken # For token counting (though not directly used in embedding here, good for context)
 
 # ────────────────────────────── helpers ──────────────────────────────
 def log(msg: str) -> None:
@@ -20,68 +25,90 @@ def log(msg: str) -> None:
 
 # ─────────────────────────────── config ──────────────────────────────
 DATA_PATH        = "data/chunks/all_chunks.json"
-KEYWORD_OUTPATH  = "data/keyword_set.json"      # ← NEW
+KEYWORD_OUTPATH  = "data/keyword_set.json"
 COLLECTION_NAME  = "westland-openai-embedding"
-EMBED_MODEL      = "text-embedding-3-large"
-EMBED_DIM        = 1536
-KW_MODEL_NAME    = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+EMBED_MODEL      = "text-embedding-3-large" # OpenAI embedding model
+EMBED_DIM        = 1536 # Dimension for text-embedding-3-large
+KW_MODEL_NAME    = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2" # For KeyBERT
 BATCH_SIZE       = 128
 TOP_KW           = 5
 DUTCH_STOP       = get_stop_words("dutch")
 
+# Ensure the output directory for keywords exists
+pathlib.Path(KEYWORD_OUTPATH).parent.mkdir(parents=True, exist_ok=True)
+
 # ──────────────────────────── load data ──────────────────────────────
 log(f"Loading chunks from {DATA_PATH} …")
-with open(DATA_PATH, encoding="utf-8") as f:
-    all_chunks = json.load(f)
-log(f"Loaded {len(all_chunks)} chunks.")
+try:
+    with open(DATA_PATH, encoding="utf-8") as f:
+        all_chunks = json.load(f)
+    log(f"Loaded {len(all_chunks)} chunks.")
+except FileNotFoundError:
+    log(f"Error: {DATA_PATH} not found. Please ensure 'allchunks.py' has been run.")
+    exit(1)
+except json.JSONDecodeError:
+    log(f"Error: Could not decode JSON from {DATA_PATH}. Check file integrity.")
+    exit(1)
 
-# ───────────────────────── initialise clients ────────────────────────
-log("Initialising clients and models …")
-qdrant        = QdrantClient(host="localhost", port=6333)
-openai_client = OpenAI()
-kw_model      = KeyBERT(SentenceTransformer(KW_MODEL_NAME))
+# ─────────────────────────── init clients ────────────────────────────
+log("Initializing OpenAI client…")
+try:
+    client_openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    # Test OpenAI API key (optional but good for early failure)
+    # client_openai.models.list()
+except Exception as e:
+    log(f"Error initializing OpenAI client. Check OPENAI_API_KEY environment variable. Error: {e}")
+    exit(1)
 
-# ────────────────────────── collection setup ─────────────────────────
-if qdrant.collection_exists(collection_name=COLLECTION_NAME):
-    log(f"❗ Collection '{COLLECTION_NAME}' already exists – deleting.")
-    qdrant.delete_collection(collection_name=COLLECTION_NAME)
 
-log(f"✅ Creating collection '{COLLECTION_NAME}' …")
-qdrant.create_collection(
-    collection_name=COLLECTION_NAME,
-    vectors_config=models.VectorParams(size=EMBED_DIM, distance=models.Distance.COSINE),
-)
+log("Initializing Qdrant client…")
+qdrant = QdrantClient("localhost", port=6333)
 
-# ─────────────────────────── embed helper ────────────────────────────
-def truncate_text(text, max_tokens=8000, model_name=EMBED_MODEL):
-    enc = tiktoken.encoding_for_model(model_name)
-    tokens = enc.encode(text)
-    return enc.decode(tokens[:max_tokens]) if len(tokens) > max_tokens else text
+log("Initializing KeyBERT model…")
+kw_model = KeyBERT(KW_MODEL_NAME)
 
-def get_openai_embeddings(texts, model=EMBED_MODEL):
-    clean = [truncate_text(t.replace("\n", " ")) for t in texts]
-    resp  = openai_client.embeddings.create(input=clean, model=model, dimensions=EMBED_DIM)
-    return [d.embedding for d in resp.data]
+# ─────────────────────────── Qdrant setup ────────────────────────────
+log(f"Checking Qdrant collection '{COLLECTION_NAME}'…")
+try:
+    # This will recreate the collection, wiping existing data.
+    # For incremental updates, you would use client.get_collection and client.upsert.
+    qdrant.recreate_collection(
+        collection_name=COLLECTION_NAME,
+        vectors_config=models.VectorParams(size=EMBED_DIM, distance=models.Distance.COSINE),
+    )
+    log(f"Collection '{COLLECTION_NAME}' recreated successfully.")
+except Exception as e:
+    log(f"Error recreating Qdrant collection: {e}")
+    exit(1)
 
-# ───────────────────────────── main loop ─────────────────────────────
-total_uploaded  = 0
-keyword_set: set[str] = set()                       # ← NEW
-batches         = range(0, len(all_chunks), BATCH_SIZE)
-log(f"Starting upload: {len(batches)} batches of ≤{BATCH_SIZE} chunks each.")
+# ─────────────────────────── ingest chunks ───────────────────────────
+log("Starting chunk ingestion…")
+total_uploaded = 0
+keyword_set = set()
 
-for batch_idx, start in enumerate(batches, 1):
-    log(f"\n— Batch {batch_idx}/{len(batches)} —")
-    batch   = all_chunks[start:start + BATCH_SIZE]
-    texts   = [c["text"] for c in batch]
-    vectors = get_openai_embeddings(texts)
-    log(f"Embedding vector length: {len(vectors[0])}")
+# Process chunks in batches
+for i in tqdm(range(0, len(all_chunks), BATCH_SIZE), desc="Embedding chunks"):
+    batch = all_chunks[i : i + BATCH_SIZE]
+    texts_to_embed = [chunk["text"] for chunk in batch]
+
+    t_embed_start = time.time()
+    try:
+        # Get embeddings from OpenAI
+        response = client_openai.embeddings.create(input=texts_to_embed, model=EMBED_MODEL)
+        embeddings = [item.embedding for item in response.data]
+    except Exception as e:
+        log(f"OpenAI embedding failed for batch {i} to {i + BATCH_SIZE}. Error: {e}")
+        # Log and skip this batch, or implement retry logic
+        continue
+    log(f"Batch embedded in {time.time() - t_embed_start:.2f}s")
 
     points = []
     t_kw_start = time.time()
+    for j, chunk in enumerate(batch):
+        text = chunk["text"]
+        vec = embeddings[j]
 
-    for j, (chunk, vec) in enumerate(zip(batch, vectors)):
-        idx, text = start + j, chunk["text"]
-
+        # Extract keywords using KeyBERT
         try:
             kws = [
                 kw for kw, _ in kw_model.extract_keywords(
@@ -93,34 +120,50 @@ for batch_idx, start in enumerate(batches, 1):
                 )
             ]
         except Exception as e:
-            log(f"Keyword extraction failed on chunk {idx}: {e}")
+            log(f"Keyword extraction failed on chunk {chunk.get('id', 'N/A')}: {e}")
             traceback.print_exc()
             kws = []
 
-        keyword_set.update(kws)                     # ← NEW
+        keyword_set.update(kws)
 
-        if j == 0:
-            log(f"Sample chunk id={idx} → kws={kws}")
+        if j == 0: # Log sample chunk from first batch
+            log(f"Sample chunk id={chunk.get('id', 'N/A')} → kws={kws}")
 
         points.append(
             models.PointStruct(
-                id=idx,
+                id=str(chunk["id"]), # Use the UUID generated in chunk.py as the Qdrant ID
                 vector=vec,
-                payload={"text": text, "source": chunk["source"], "keywords": kws},
+                payload={
+                    "text": text,
+                    "source": chunk.get("source", "unknown"), # Use .get for robustness
+                    "keywords": kws,
+                    "document_type": chunk.get("document_type", "unknown"),
+                    "document_title": chunk.get("document_title", "Geen Titel"),
+                    "department": chunk.get("department", "Algemeen"),
+                    "last_modified_date": chunk.get("last_modified_date", ""),
+                    "original_file_name": chunk.get("original_file_name", ""),
+                    "chunk_idx": chunk.get("chunk_idx", 0) # Include chunk index for ordering within doc if needed
+                },
             )
         )
 
     log(f"Keywords for {len(batch)} chunks extracted in {time.time() - t_kw_start:.2f}s")
 
     t_upsert = time.time()
-    qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
-    log(f"Upserted {len(points)} points in {time.time() - t_upsert:.2f}s")
-    total_uploaded += len(points)
+    try:
+        qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
+        log(f"Upserted {len(points)} points in {time.time() - t_upsert:.2f}s")
+        total_uploaded += len(points)
+    except Exception as e:
+        log(f"Error during Qdrant upsert for batch {i} to {i + BATCH_SIZE}. Error: {e}")
+        traceback.print_exc()
 
 # ─────────────────────────── after ingest ────────────────────────────
 log(f"\n🎉 Done! {total_uploaded} chunks embedded and stored in Qdrant.")
 log(f"Saving {len(keyword_set)} unique keywords → {KEYWORD_OUTPATH}")
-os.makedirs(os.path.dirname(KEYWORD_OUTPATH), exist_ok=True)
-with open(KEYWORD_OUTPATH, "w", encoding="utf-8") as f:
-    json.dump(sorted(keyword_set), f, ensure_ascii=False, indent=2)
-log("Keyword set saved successfully.")
+try:
+    with open(KEYWORD_OUTPATH, "w", encoding="utf-8") as out:
+        json.dump(list(keyword_set), out, ensure_ascii=False, indent=2)
+    log("Keyword set saved.")
+except Exception as e:
+    log(f"Error saving keyword set: {e}")
