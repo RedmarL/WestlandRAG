@@ -2,17 +2,16 @@ import pathlib
 import json
 import time
 import requests
-from typing import List, Dict, Union, Any
+from typing import List, Dict, Union, Any, Optional
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from bs4 import BeautifulSoup, Tag
-import uuid # For generating unique IDs
-from datetime import datetime # For timestamps
-import logging # For better logging
+import uuid
+from datetime import datetime, timezone # Use timezone for consistency
+import re # For regex if needed for date/author extraction
 
-# ---------- Configuration ----------
-# Use RAW_PAGES_DIR for consistency, as per crawl.py
-RAW_PAGES_DIR = pathlib.Path("data/raw_pages")
+# ---------- constants ----------
+RAW_PAGES_DIR = pathlib.Path("data/raw_pages") # Directory containing HTML JSON files
 CHUNK_DIR = pathlib.Path("data/chunks")
 CHUNK_DIR.mkdir(exist_ok=True)
 
@@ -22,196 +21,257 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 MAX_TOKENS = 512
 OVERLAP = 100
 
-# Configure logging
-logging.basicConfig(
-    filename=CHUNK_DIR / 'chunking_activity.log',
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logging.getLogger().addHandler(logging.StreamHandler()) # Also print to console
-
-# ---------- Helper Functions ----------
+# ---------- helpers ----------
 
 def extract_content_from_html(html_content: str) -> Dict[str, Any]:
     """
     Parses HTML to extract structured content blocks (headings, paragraphs, lists, tables)
-    along with the main document title.
-    Focuses on main content elements and tries to filter out common boilerplate.
+    along with the main document title, publication/last-modified date, and author/department.
     """
     soup = BeautifulSoup(html_content, 'html.parser')
 
-    # Get document title from <title> tag
-    document_title = soup.title.string if soup.title and soup.title.string else "Onbekend document"
+    document_title = soup.title.string if soup.title else "Geen titel"
+    extracted_date: Optional[str] = None
+    author_department: Optional[str] = None
+
+    # --- Date Extraction ---
+    # Try to get from common meta tags
+    date_meta_tags = [
+        {'property': 'article:published_time'},
+        {'property': 'article:modified_time'},
+        {'name': 'date'},
+        {'name': 'pubdate'},
+        {'itemprop': 'datePublished'},
+        {'itemprop': 'dateModified'}
+    ]
+    for attrs in date_meta_tags:
+        meta_tag = soup.find('meta', attrs=attrs)
+        if meta_tag and 'content' in meta_tag.attrs:
+            extracted_date = meta_tag['content']
+            break
+    
+    # Fallback: look for a specific span/div often used for publication dates
+    if not extracted_date:
+        date_span = soup.find('span', class_=re.compile(r'date|published|modified', re.IGNORECASE))
+        if date_span:
+            # Attempt to parse text in the span, e.g., 'Gepubliceerd op 10 juni 2024'
+            date_text = date_span.get_text(strip=True)
+            # More robust date parsing might be needed here, e.g., dateutil.parser.parse
+            # For now, we'll just take the text, assuming it's somewhat parsable later.
+            if re.search(r'\d{1,2}\s+(jan|feb|mar|apr|mei|jun|jul|aug|sep|okt|nov|dec)\w*\s+\d{4}', date_text, re.IGNORECASE):
+                extracted_date = date_text.strip()
+
+
+    # --- Author/Department Extraction ---
+    # This part is highly dependent on the website's specific HTML structure.
+    # You'll need to inspect pages on gemeentewestland.nl to find reliable selectors.
+    # Examples:
+    # Look for specific divs or spans known to contain author/department info
+    department_tag = soup.find('span', class_='department-name') # Example class
+    if department_tag:
+        author_department = department_tag.get_text(strip=True)
+    
+    if not author_department:
+        # Check common footer or header areas that might mention departments
+        footer_text = soup.find('footer')
+        if footer_text:
+            match = re.search(r"(Afdeling|Dienst|Team):\s*([A-Za-z\s]+)", footer_text.get_text(), re.IGNORECASE)
+            if match:
+                author_department = match.group(2).strip()
+    
+    # Fallback: if no specific department found, maybe default to "Gemeente Westland" or "Onbekend"
+    if not author_department:
+        author_department = "Gemeente Westland" # Defaulting if not found
 
     content_blocks = []
+    # A simple approach: extract text from common content tags
+    # You might want to refine this based on Westland's website structure to avoid boilerplate.
+    # Consider filtering out navigation, footers, headers, sidebars.
+    # Example: filter by parent element IDs/classes or based on tag hierarchy.
+    main_content_area = soup.find('main') or soup.find('div', class_='main-content') # Find main content div
+    if main_content_area:
+        for tag in main_content_area.find_all(['h1', 'h2', 'h3', 'p', 'li', 'table', 'div'], recursive=False):
+            # Further refine filtering if needed, e.g., skip empty tags or specific classes
+            if tag.name == 'div' and not tag.get_text(strip=True):
+                continue # Skip empty divs
+            content_blocks.append(tag.get_text(separator="\n", strip=True))
+    else: # Fallback if no main content area found
+        for tag in soup.find_all(['h1', 'h2', 'h3', 'p', 'li', 'table'], class_=lambda x: 'nav' not in str(x).lower() and 'footer' not in str(x).lower()):
+            content_blocks.append(tag.get_text(separator="\n", strip=True))
 
-    # Attempt to find the main content area. This is highly dependent on website structure.
-    # Common patterns: <main> tag, div with specific ID/class (e.g., 'main-content', 'article-body')
-    # For a general approach, we'll iterate common tags, but be aware of noise.
-    main_content_div = soup.find('main') or soup.find('div', class_='main-content') or soup.find('article')
+    # Basic cleanup: remove excessive newlines
+    content_blocks = [re.sub(r'\n\s*\n', '\n', block).strip() for block in content_blocks if block.strip()]
 
-    # If a specific main content area is found, limit search to that area
-    if main_content_div:
-        search_scope = main_content_div
-    else:
-        search_scope = soup # Fallback to entire soup if main content area not found
 
-    # Iterate through common content-bearing tags
-    for tag in search_scope.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'li', 'table', 'div']):
-        # Basic filtering to exclude common non-content elements
-        # This list might need to be expanded based on specific website's HTML structure
-        if tag.name == 'div' and (
-            'navbar' in tag.get('class', []) or 'header' in tag.get('id', '') or
-            'footer' in tag.get('id', '') or 'sidebar' in tag.get('class', []) or
-            'navigation' in tag.get('class', []) or 'cookie-notice' in tag.get('class', [])
-        ):
-            continue
-
-        if tag.name == 'table':
-            # For tables, convert to a simplified text representation
-            table_text = []
-            for row in tag.find_all('tr'):
-                row_data = [cell.get_text(strip=True) for cell in row.find_all(['td', 'th'])]
-                if row_data:
-                    # Filter out empty rows or rows with only boilerplate (e.g., hidden formatting)
-                    cleaned_row_data = [d for d in row_data if d.strip()]
-                    if cleaned_row_data:
-                        table_text.append("|".join(cleaned_row_data))
-            if table_text:
-                content_blocks.append({"type": "table", "text": "\n".join(table_text)})
-        else:
-            text = tag.get_text(separator=' ', strip=True)
-            if text:
-                content_blocks.append({"type": tag.name, "text": text})
-
-    return {"document_title": document_title, "content_blocks": content_blocks}
-
+    return {
+        "content_blocks": content_blocks,
+        "document_title": document_title,
+        "extracted_date": extracted_date,
+        "author_department": author_department
+    }
 
 def split_content_blocks_by_tokens(
-    document_data: Dict[str, Any], max_tokens: int, overlap: int, doc_metadata: Dict[str, Any]
+    doc_data: Dict[str, Any], # Now expects dict with "document_title" and "content_blocks"
+    max_tokens: int,
+    overlap: int,
+    doc_metadata: Dict[str, Any] # Contains document-level metadata like source_url, category etc.
 ) -> List[Dict[str, Any]]:
     """
-    Splits document content blocks into chunks based on token limits with overlap.
-    Includes document-level metadata and a unique ID for each chunk.
+    Splits content blocks into chunks based on token limits,
+    ensuring each chunk retains full document metadata.
     """
     chunks = []
     current_chunk_text = ""
     current_chunk_tokens = 0
-
-    document_title = document_data.get("document_title", "Onbekend document")
-    content_blocks = document_data.get("content_blocks", [])
-
-    for block in content_blocks:
-        block_text = block["text"]
+    
+    # Prepend title to every chunk
+    title_text = doc_data.get("document_title", "")
+    if title_text:
+        title_text = f"Titel: {title_text}\n\n"
+    
+    for block_text in doc_data["content_blocks"]:
         block_tokens = len(tokenizer.encode(block_text))
 
-        # Check if adding this block exceeds max_tokens
-        if current_chunk_tokens + block_tokens <= max_tokens:
-            current_chunk_text += (" " + block_text if current_chunk_text else block_text)
-            current_chunk_tokens += block_tokens
-        else:
-            # If current chunk is not empty, save it
+        # Check if adding the current block exceeds MAX_TOKENS
+        # Account for title tokens if prepending
+        if current_chunk_tokens + block_tokens > max_tokens:
+            # If current chunk has content, finalize it before adding new block
             if current_chunk_text:
-                chunk_id = str(uuid.uuid4()) # Generate UUID for this chunk
-                chunk_metadata = {
-                    "id": chunk_id, # Use UUID as chunk ID
-                    "text": current_chunk_text,
-                    "document_title": document_title,
-                    **doc_metadata, # Include all document-level metadata
-                    "chunk_idx": len(chunks) # Index of this chunk within its document
-                }
-                chunks.append(chunk_metadata)
+                chunk_id = str(uuid.uuid4())
+                chunks.append({
+                    "id": chunk_id,
+                    "text": current_chunk_text.strip(),
+                    "token_count": current_chunk_tokens,
+                    **doc_metadata # Spread document-level metadata into each chunk
+                })
 
-            # Start a new chunk, potentially with overlap
-            if overlap > 0 and current_chunk_text:
-                # Ensure we don't try to overlap more tokens than available in current_chunk_text
-                encoded_current_chunk = tokenizer.encode(current_chunk_text)
-                actual_overlap_tokens = min(overlap, len(encoded_current_chunk))
-                overlap_text = tokenizer.decode(encoded_current_chunk[-actual_overlap_tokens:])
-                
-                current_chunk_text = overlap_text + " " + block_text
+                # Prepare for next chunk with overlap
+                overlap_text = tokenizer.decode(tokenizer.encode(current_chunk_text)[-overlap:])
+                current_chunk_text = overlap_text + "\n" + block_text
                 current_chunk_tokens = len(tokenizer.encode(current_chunk_text))
             else:
-                current_chunk_text = block_text
-                current_chunk_tokens = block_tokens
+                # If a single block is larger than MAX_TOKENS, split it
+                # This is a simplified split; for very large blocks, a more
+                # sophisticated recursive splitting might be needed.
+                sub_blocks = []
+                words = block_text.split()
+                temp_block = []
+                for word in words:
+                    temp_block.append(word)
+                    if len(tokenizer.encode(" ".join(temp_block))) > max_tokens:
+                        sub_blocks.append(" ".join(temp_block[:-1]))
+                        temp_block = [word]
+                if temp_block:
+                    sub_blocks.append(" ".join(temp_block))
+                
+                for sub_block in sub_blocks:
+                    chunk_id = str(uuid.uuid4())
+                    chunks.append({
+                        "id": chunk_id,
+                        "text": title_text + sub_block.strip(), # Prepend title to sub-blocks too
+                        "token_count": len(tokenizer.encode(title_text + sub_block)),
+                        **doc_metadata
+                    })
+                current_chunk_text = "" # Reset after splitting large block
+                current_chunk_tokens = 0
 
-    # Add the last chunk if it's not empty
+        else:
+            current_chunk_text += (f"\n{block_text}" if current_chunk_text else block_text)
+            current_chunk_tokens += block_tokens
+
+    # Add the last accumulated chunk if it has content
     if current_chunk_text:
-        chunk_id = str(uuid.uuid4()) # Generate UUID for the last chunk too
-        chunk_metadata = {
-            "id": chunk_id, # Use UUID as chunk ID
-            "text": current_chunk_text,
-            "document_title": document_title,
-            **doc_metadata,
-            "chunk_idx": len(chunks)
-        }
-        chunks.append(chunk_metadata)
+        chunk_id = str(uuid.uuid4())
+        chunks.append({
+            "id": chunk_id,
+            "text": current_chunk_text.strip(),
+            "token_count": current_chunk_tokens,
+            **doc_metadata
+        })
+    
+    # Prepend title to all chunks
+    final_chunks = []
+    for chunk in chunks:
+        chunk['text'] = title_text + chunk['text']
+        chunk['token_count'] = len(tokenizer.encode(chunk['text']))
+        final_chunks.append(chunk)
 
-    return chunks
+    return final_chunks
 
-# ---------- Main Processing Loop ----------
+
+# ---------- Main Processing Logic ----------
+
 def main():
-    logging.info("Starting HTML chunking process.")
+    print(f"Starting chunking process for files in {RAW_PAGES_DIR}...")
 
-    html_files = list(RAW_PAGES_DIR.glob('*.json'))
-    if not html_files:
-        logging.error(f"No HTML files found in {RAW_PAGES_DIR}. Please run crawl.py first.")
+    raw_html_files = list(RAW_PAGES_DIR.glob('*.json'))
+    if not raw_html_files:
+        print(f"No raw HTML files found in {RAW_PAGES_DIR}. Please run crawl.py first.")
         return
 
-    logging.info(f"Processing {len(html_files)} HTML files for chunking...")
-
-    for file_path in tqdm(html_files, desc="Chunking HTML files"):
+    for file_path in tqdm(raw_html_files, desc="Processing HTML files"):
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+                record = json.load(f)
 
-            source_url = data.get("url")
-            html_content = data.get("html")
-            original_file_name = file_path.name # Use the slug filename here
-            last_modified_date = datetime.now().isoformat() # This timestamp is when the HTML was crawled
+            source_url = record.get("url")
+            html_content = record.get("html")
+            
+            # Retrieve new metadata added by crawl.py
+            last_modified_header = record.get("last_modified_header")
+            inferred_category = record.get("category", "Algemeen") # Default to Algemeen if not found
 
             if not source_url or not html_content:
-                logging.warning(f"Skipped {file_path.name}: Missing URL or HTML content.")
+                tqdm.write(f"⚠️ Skipped (missing URL or HTML content): {file_path.name}")
                 continue
 
-            # Default metadata for HTML pages.
-            # department: Could be inferred from URL path segments or page content if logic is added.
-            doc_metadata = {
-                "source": source_url, # Renamed source_url to source for consistency with Qdrant payload
-                "document_type": "html_page",
-                "department": "Algemeen", # Placeholder, improve if possible
-                "last_modified_date": last_modified_date,
-                "original_file_name": original_file_name
-            }
-
+            # NEW: Extract content blocks, document title, date, and author/department from HTML
             parsed_data = extract_content_from_html(html_content)
             content_blocks = parsed_data["content_blocks"]
             document_title = parsed_data["document_title"]
+            extracted_date = parsed_data["extracted_date"]
+            author_department = parsed_data["author_department"]
 
             if not content_blocks:
-                logging.info(f"Skipped (no significant content blocks extracted): {file_path.name}")
+                tqdm.write(f"⚠️ Skipped (no content blocks extracted): {file_path.name}")
                 continue
+            
+            # Determine the best document date to use
+            final_document_date = extracted_date # Prioritize date found in meta tags/content
+            if not final_document_date and last_modified_header:
+                final_document_date = last_modified_header # Fallback to HTTP header date
+            
+            # Prepare document-level metadata to pass to chunking function
+            doc_metadata = {
+                "source_url": source_url,
+                "document_type": "html_page", # Explicitly set for HTML documents
+                "document_title": document_title, # Pass the extracted title
+                "document_date": final_document_date, # Use the best available date
+                "category": inferred_category, # From crawl.py
+                "author_department": author_department, # Extracted from HTML
+            }
 
+            # Split content blocks into final chunks, passing all document metadata
             chunks = split_content_blocks_by_tokens(
                 {"document_title": document_title, "content_blocks": content_blocks},
                 MAX_TOKENS,
                 OVERLAP,
-                doc_metadata
+                doc_metadata # Pass the rich metadata
             )
 
             # Write out each chunk as a separate JSON file
-            for chunk in chunks: # Iterate directly over chunks, no need for idx here for filename
-                # Use the UUID from the chunk's payload as part of the filename for uniqueness and traceability
-                out_path = CHUNK_DIR / f"{file_path.stem}_{chunk['id']}.json"
+            for idx, chunk in enumerate(chunks):
+                out_path = CHUNK_DIR / f"{file_path.stem}_chunk{idx}.json"
+                # Ensure the entire chunk dictionary, including all metadata, is dumped
                 json.dump(chunk, out_path.open("w", encoding="utf-8"), ensure_ascii=False, indent=2)
-            logging.info(f"Processed {file_path.name} → {len(chunks)} chunks.")
+            tqdm.write(f"✅ Processed {file_path.name} → {len(chunks)} chunks.")
 
         except json.JSONDecodeError:
-            logging.error(f"Failed to parse JSON from {file_path.name}")
+            tqdm.write(f"❌ Failed to parse JSON from {file_path.name}. Check if it's valid JSON.")
         except Exception as e:
-            logging.error(f"Error processing {file_path.name}: {e}", exc_info=True) # exc_info to log traceback
+            tqdm.write(f"❌ Error processing {file_path.name}: {e}")
 
-    logging.info("HTML chunking process complete.")
+    print("Chunking process complete.")
 
 if __name__ == "__main__":
     main()
