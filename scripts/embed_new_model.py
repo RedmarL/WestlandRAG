@@ -14,6 +14,7 @@ from qdrant_client.http import models
 from sentence_transformers import SentenceTransformer
 from stop_words import get_stop_words
 import tiktoken # For token counting if needed, though chunk.py now handles it
+from tqdm import tqdm # ADD THIS LINE
 
 # ────────────────────────────── helpers ──────────────────────────────
 def log(msg: str) -> None:
@@ -24,7 +25,7 @@ DATA_PATH        = "all_chunks.json"      # Assuming all_chunks.json is generate
 KEYWORD_OUTPATH  = "data/keyword_set.json"
 COLLECTION_NAME  = "westland-openai-embedding"
 EMBED_MODEL      = "text-embedding-3-large"
-EMBED_DIM        = 1536 # Dimension of text-embedding-3-large
+EMBED_DIM        = 3072 # Dimension of text-embedding-3-large
 KW_MODEL_NAME    = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 BATCH_SIZE       = 128
 TOP_KW           = 5
